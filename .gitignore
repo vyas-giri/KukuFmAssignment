@@ -1,0 +1,14 @@
+# data
+data/
+# env
+.env
+.env.local
+# python
+.venv/
+__pycache__/
+.cache/
+# contains script text (confidential pack) -> share via Drive, not git
+outputs/
+eval/label_sheet.md
+eval/key.json
+eval/labels.csv
