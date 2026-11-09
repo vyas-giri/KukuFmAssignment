@@ -3,7 +3,7 @@
 usage: python src/pipeline.py 50        (one episode)
        python src/pipeline.py 1 50      (range, inclusive)
 """
-import json, sys
+import json, re, sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -58,20 +58,24 @@ def judge(items, model=None):
             continue
         sc["problem"] = s.get("problem", "")
         sc["score"] = combined(sc)
-        res[str(s.get("clip"))] = sc
+        res[re.sub(r"^\s*CLIP\s+", "", str(s.get("clip")), flags=re.I).strip()] = sc   # model sometimes echoes "CLIP E4P8"
     return res
 
 
-def run_episode(n, log):
+JUDGE_BATCH = 8   # clips per judge call; batching keeps free-tier request counts low
+
+
+def propose(n, log):
+    """1 LLM call: candidate promos for one episode, validated and refit by code."""
     ep = load(n)
     user = f"EPISODE {n} LOGLINE: {ep['logline']}\n\nBEATS (id start-end | content):\n{episode_text(ep)}"
     raw = chat_json(PROPOSE, user).get("promos", [])
-    cands = []
+    cands, seen = [], set()
     for k, p in enumerate(raw):
         entry = {"episode": n, "k": k, "proposed": p}
         try:
             c = span(ep, p["start_beat"], p["end_beat"])
-        except (KeyError, ValueError) as e:
+        except (KeyError, ValueError, TypeError) as e:
             entry["issue"] = f"rejected: {e}"; log.append(entry); continue
         if not c["valid"]:
             before = c["dur"]
@@ -81,48 +85,61 @@ def run_episode(n, log):
                 entry["issue"] += " (still invalid, dropped)"; log.append(entry); continue
         if "issue" in entry:
             log.append(entry)
-        c.update(hook=p.get("hook", ""), cliffhanger=p.get("cliffhanger", ""), why=p.get("why", ""))
+        if (c["first"], c["last"]) in seen:
+            continue
+        seen.add((c["first"], c["last"]))
+        fs = first_seconds(ep, c["start"])
+        c.update(hook=p.get("hook", ""), cliffhanger=p.get("cliffhanger", ""), why=p.get("why", ""),
+                 segments=[{"episode": n, "start": c["start"], "end": c["end"]}],
+                 opening_line=fs[0]["text"] if fs else "", closing_line=clip_beats(ep, c)[-1]["text"],
+                 model=default_model())
         cands.append(c)
-    # drop exact duplicates
-    seen, uniq = set(), []
-    for c in cands:
-        if (c["first"], c["last"]) not in seen:
-            seen.add((c["first"], c["last"])); uniq.append(c)
-    if uniq:
-        scores = judge([(ep, c, f"P{i}") for i, c in enumerate(uniq)])
-        for i, c in enumerate(uniq):
-            s = scores.get(f"P{i}")
-            if s is None:
-                log.append({"episode": n, "issue": f"judge skipped clip P{i}"}); continue
-            c["judge"] = s; c["score"] = s["score"]
-        uniq = [c for c in uniq if "score" in c]
-    for c in uniq:
-        c["segments"] = [{"episode": n, "start": c["start"], "end": c["end"]}]
-        c["opening_line"] = first_seconds(ep, c["start"])[0]["text"] if first_seconds(ep, c["start"]) else ""
-        c["closing_line"] = clip_beats(ep, c)[-1]["text"]
-        c["model"] = default_model()
-    return uniq
+    return cands
+
+
+def judge_all(cands, log):
+    """Score every candidate, JUDGE_BATCH clips per call. Clip ids are unique across episodes."""
+    for i in range(0, len(cands), JUDGE_BATCH):
+        batch = cands[i:i + JUDGE_BATCH]
+        items = [(load(c["episode"]), c, f"E{c['episode']}P{i + k}") for k, c in enumerate(batch)]
+        try:
+            scores = judge(items)
+        except Exception as e:
+            print(f"judge batch {i // JUDGE_BATCH}: FAILED {type(e).__name__}: {str(e)[:200]}", flush=True)
+            log.append({"issue": f"judge batch failed: {e}"}); continue
+        for ep, c, cid in items:
+            if cid in scores:
+                c["judge"] = scores[cid]; c["score"] = scores[cid]["score"]
+            else:
+                log.append({"episode": c["episode"], "issue": f"judge skipped clip {cid}"})
+        print(f"judged {min(i + JUDGE_BATCH, len(cands))}/{len(cands)}", flush=True)
+    return [c for c in cands if "score" in c]
 
 
 def main():
     a = int(sys.argv[1]); b = int(sys.argv[2]) if len(sys.argv) > 2 else a
     OUT.mkdir(exist_ok=True)
-    log, allc = [], []
+    log, allc, fails = [], [], 0
     for n in range(a, b + 1):
         try:
-            cs = run_episode(n, log)
+            cs = propose(n, log); fails = 0
         except Exception as e:
-            print(f"ep{n:>2}: FAILED {type(e).__name__}: {str(e)[:300]}"); log.append({"episode": n, "issue": f"failed: {e}"})
+            print(f"ep{n:>2}: FAILED {type(e).__name__}: {str(e)[:300]}", flush=True)
+            log.append({"episode": n, "issue": f"failed: {e}"}); fails += 1
+            if fails >= 3:
+                print("3 failures in a row (quota?) - stopping; rerun later, finished calls are cached", flush=True)
+                break
             continue
         allc += cs
-        best = max((c["score"] for c in cs), default=0)
-        print(f"ep{n:>2}: {len(cs)} promos, best {best:.1f}")
+        print(f"ep{n:>2}: {len(cs)} candidates", flush=True)
+    allc = judge_all(allc, log)
     tag = f"{a}-{b}"
     (OUT / f"candidates_{tag}.json").write_text(json.dumps(allc, indent=1))
     with open(OUT / f"validation_log_{tag}.jsonl", "w") as f:
         for e in log:
             f.write(json.dumps(e) + "\n")
-    print(f"\n{len(allc)} promos -> outputs/candidates_{tag}.json; {len(log)} validation issues logged")
+    print(f"\n{len(allc)} promos from {len({c['episode'] for c in allc})} episodes -> outputs/candidates_{tag}.json; "
+          f"{len(log)} validation issues logged", flush=True)
 
 
 if __name__ == "__main__":

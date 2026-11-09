@@ -27,8 +27,8 @@ def baseline(n):
         e = rng.choice(eps)
         w = random_window(load(e), rng)
         if w: picks.append(w)
-    for i in range(0, n, 5):   # 5 clips per judge call
-        batch = picks[i:i + 5]
+    for i in range(0, n, 8):   # 8 clips per judge call
+        batch = picks[i:i + 8]
         s = judge([(load(w["episode"]), w, f"R{i + k}") for k, w in enumerate(batch)])
         for k, w in enumerate(batch):
             if f"R{i + k}" in s:
